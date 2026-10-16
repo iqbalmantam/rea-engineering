@@ -1,0 +1,2 @@
+streamlit>=1.40
+nodejs-wheel-binaries>=22.20.0
