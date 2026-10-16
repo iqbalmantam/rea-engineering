@@ -196,10 +196,14 @@ def run_cli(
     *,
     timeout: int = 600,
     out_name: str = "out.json",
+    extra_env: dict[str, str] | None = None,
 ) -> RunResult:
     """Jalankan `prefix + args`; stdout ke berkas, stderr dipotong 64 KiB."""
     argv = [*prefix, *args]
     out_path = workdir / out_name
+    env = tool_env()
+    if extra_env:
+        env.update(extra_env)
     start = time.monotonic()
     try:
         with out_path.open("wb") as fh:
@@ -210,7 +214,7 @@ def run_cli(
                 timeout=timeout,
                 check=False,
                 cwd=str(workdir),
-                env=tool_env(),
+                env=env,
             )
         stderr = proc.stderr[:65536].decode("utf-8", "replace")
         return RunResult(argv, proc.returncode, out_path, stderr, time.monotonic() - start)
@@ -353,6 +357,22 @@ MODES: dict[str, Mode] = {
         "file",
         [],
     ),
+    "apk": Mode(
+        "apk",
+        "Android APK",
+        "Manifest dan izin, daftar kelas, serta dekompilasi method dari APK (statis, tanpa menjalankan aplikasi).",
+        "file",
+        ["apk"],
+        "JDK 17+ (dipasang lewat packages.txt) dan JADX 0.7.1 (diunduh & diverifikasi otomatis)",
+    ),
+    "web": Mode(
+        "web",
+        "Website (dibuka langsung)",
+        "App membuka URL di Chromium headless milik server, lalu REA mengamati halaman: struktur DOM, skrip, request jaringan, dan bundle.",
+        "url",
+        [],
+        "Chromium (dipasang lewat packages.txt)",
+    ),
     "artifact": Mode(
         "artifact",
         "Inventaris paket / aplikasi",
@@ -382,7 +402,43 @@ def build_args(mode_key: str, target: Path, opts: dict) -> list[str]:
         return ["inspect-rust-binary", t, "--json"]
     if mode_key == "artifact":
         return ["inspect-artifact", t, "--json"]
+    if mode_key == "apk":
+        return apk_args("package", target)
     raise KeyError(mode_key)
+
+
+def apk_args(kind: str, target: Path, **kw) -> list[str]:
+    """Argumen untuk perintah Android: package | search | class | method."""
+    t = str(target)
+    if kind == "package":
+        return ["inspect-android-package", t, "--json"]
+    if kind == "search":
+        return ["search-android-classes", t, kw.get("query", ""), "--json"]
+    if kind == "class":
+        return ["inspect-android-class", t, kw["class_name"], "--json"]
+    if kind == "method":
+        args = ["inspect-android-method", t, kw["class_name"], kw["method_name"], "--json"]
+        if kw.get("overload_index") is not None:
+            args += ["--overload-index", str(int(kw["overload_index"]))]
+        return args
+    raise KeyError(kind)
+
+
+def web_args(kind: str, endpoint: str, target_id: str, **kw) -> list[str]:
+    """Argumen untuk perintah website: inspect | bundle."""
+    ms = str(int(kw.get("observation_ms", 3000)))
+    if kind == "inspect":
+        args = ["inspect-web-page", endpoint, target_id, "--json", "--observation-ms", ms]
+        for flag in ("include_json_body_shapes", "include_script_sources", "include_storage_keys"):
+            if kw.get(flag):
+                args.append("--" + flag.replace("_", "-"))
+        return args
+    if kind == "bundle":
+        args = ["analyze-web-bundle", endpoint, target_id, "--json", "--observation-ms", ms]
+        if kw.get("fetch_source_maps"):
+            args.append("--fetch-source-maps")
+        return args
+    raise KeyError(kind)
 
 
 def build_members_args(target: Path, types: list[str]) -> list[str]:

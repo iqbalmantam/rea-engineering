@@ -1,1 +1,3 @@
 procps
+chromium
+default-jdk-headless

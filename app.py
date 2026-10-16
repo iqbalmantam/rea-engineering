@@ -1,7 +1,8 @@
 """Antarmuka web Streamlit untuk REA (Reverse Engineer Anything).
 
-Membungkus CLI `rea-agents` untuk analisis statis: JavaScript/Electron, .NET,
-SQLite, biner Go/Rust, dan inventaris paket. Tidak ada kode target yang dijalankan.
+Membungkus CLI `rea-agents`: JavaScript/Electron, .NET, SQLite, biner Go/Rust,
+inventaris paket, APK Android (statis), dan Website (halaman dibuka di Chromium
+milik server sehingga skrip situs ikut berjalan di sana).
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from pathlib import Path
 
 import streamlit as st
 
+import rea_extras as rx
 import rea_runner as rr
 
 st.set_page_config(page_title="REA Web UI", page_icon="🔬", layout="wide")
@@ -21,9 +23,10 @@ DOWNLOAD_LIMIT = 200 * 1024 * 1024
 
 # ---------------------------------------------------------------- helpers
 def reset_job() -> None:
-    old = st.session_state.pop("job", None)
-    if old:
-        rr.cleanup(Path(old["workdir"]))
+    for key in ("job", "webjob"):
+        old = st.session_state.pop(key, None)
+        if old:
+            rr.cleanup(Path(old["workdir"]))
 
 
 def show_run(res: rr.RunResult, label: str) -> None:
@@ -78,6 +81,83 @@ def resolve_target(mode: rr.Mode, workdir: Path, source: str, uploaded, local_pa
     return saved, None
 
 
+def web_ui(prefix, timeout: int) -> None:
+    """Mode Website: buka URL di Chromium headless milik server, lalu amati lewat REA."""
+    st.warning(
+        "Mode ini membuka situs di Chromium milik server, jadi skrip situs ikut berjalan di sana. "
+        "Gunakan hanya pada situs yang Anda miliki atau berhak periksa."
+    )
+    exe = rx.find_chromium()
+    if not exe:
+        st.error("Chromium tidak ditemukan di server. Pastikan `chromium` ada di packages.txt.")
+        return
+    url = st.text_input("URL situs", placeholder="https://contoh.com/halaman")
+    c1, c2 = st.columns(2)
+    observe_s = c1.slider("Durasi pengamatan (detik)", 1, 30, 4)
+    settle_s = c2.slider("Tunggu halaman selesai dimuat (detik)", 0, 20, 6)
+    o1, o2, o3, o4 = st.columns(4)
+    include_json = o1.checkbox("Bentuk body JSON", help="Struktur (bukan isi) respons JSON")
+    include_scripts = o2.checkbox("Sumber skrip", help="Menyertakan teks JavaScript; keluaran bisa besar")
+    include_storage = o3.checkbox("Nama kunci storage", help="Hanya nama kunci, tanpa nilai")
+    do_bundle = o4.checkbox("Analisis bundle JS", help="Rute dan endpoint dari skrip yang dimuat")
+    auth = st.checkbox("Saya memiliki situs ini atau berhak memeriksanya.")
+
+    if st.button("🌐 Buka & periksa", type="primary", disabled=prefix is None):
+        reset_job()
+        if not auth:
+            st.error("Centang pernyataan hak memeriksa terlebih dahulu.")
+        else:
+            try:
+                safe_url = rx.validate_public_url(url)
+            except rx.UnsafeUrl as exc:
+                st.error(f"URL ditolak: {exc}")
+            else:
+                workdir = rr.new_workdir()
+                results: list = []
+                try:
+                    with st.spinner("Membuka situs di Chromium dan menjalankan REA…"):
+                        sess = rx.open_page(safe_url, exe=exe, settle_seconds=float(settle_s))
+                        try:
+                            kw = dict(observation_ms=observe_s * 1000)
+                            results.append((
+                                "inspect-web-page",
+                                rr.run_cli(prefix, rr.web_args(
+                                    "inspect", sess.endpoint, sess.target_id,
+                                    include_json_body_shapes=include_json,
+                                    include_script_sources=include_scripts,
+                                    include_storage_keys=include_storage, **kw),
+                                    workdir, timeout=timeout, out_name="web-inspect.json"),
+                                "web-inspect.json",
+                            ))
+                            if do_bundle:
+                                results.append((
+                                    "analyze-web-bundle",
+                                    rr.run_cli(prefix, rr.web_args(
+                                        "bundle", sess.endpoint, sess.target_id, **kw),
+                                        workdir, timeout=timeout, out_name="web-bundle.json"),
+                                    "web-bundle.json",
+                                ))
+                        finally:
+                            info = (sess.target_url, sess.target_title)
+                            sess.close()
+                except rx.SetupError as exc:
+                    st.error(f"Gagal membuka situs: {exc}")
+                    rr.cleanup(workdir)
+                else:
+                    st.session_state["webjob"] = {
+                        "workdir": str(workdir), "url": info[0], "title": info[1], "results": results,
+                    }
+
+    wj = st.session_state.get("webjob")
+    if wj:
+        st.subheader("Hasil")
+        st.caption(f"Halaman: {wj['title'] or '(tanpa judul)'} — {wj['url']}")
+        for label, res, fname in wj["results"]:
+            st.markdown(f"**{label}**")
+            show_run(res, label)
+            show_output(res, fname, f"web_{label}")
+
+
 # ---------------------------------------------------------------- sidebar
 with st.sidebar:
     st.header("Lingkungan")
@@ -102,6 +182,9 @@ with st.sidebar:
             st.error("REA gagal dijalankan. Lihat log di bawah.")
             st.code((chk.stderr or chk.error or "(tanpa pesan)")[:2000])
         rr.cleanup(wd)
+    jv = rx.java_version()
+    st.write(f"**Java:** `{jv or 'tidak ditemukan'}` (mode APK)")
+    st.write(f"**Chromium:** `{'ada' if rx.find_chromium() else 'tidak ditemukan'}` (mode Website)")
     timeout = st.slider("Timeout per perintah (detik)", 30, 1800, 600, step=30)
     st.divider()
     st.caption(
@@ -112,7 +195,10 @@ with st.sidebar:
 
 # ---------------------------------------------------------------- main
 st.title("🔬 REA Web UI")
-st.caption("Antarmuka untuk CLI REA — analisis statis tanpa menjalankan kode target.")
+st.caption(
+    "Antarmuka untuk CLI REA. Analisis berkas bersifat statis (kode target tidak dijalankan); "
+    "mode Website membuka halaman di Chromium server, jadi skrip situs berjalan di sana."
+)
 
 mode_key = st.selectbox(
     "Jenis analisis",
@@ -122,6 +208,10 @@ mode_key = st.selectbox(
 )
 mode = rr.MODES[mode_key]
 st.info(f"{mode.description}\n\n**Kebutuhan:** {mode.needs_engine}")
+
+if mode_key == "web":
+    web_ui(prefix, timeout)
+    st.stop()
 
 source = "upload"
 if ALLOW_LOCAL_PATHS:
@@ -158,6 +248,19 @@ if run_clicked and prefix:
         st.error(err)
         rr.cleanup(workdir)
     else:
+        extra_env = None
+        if mode_key == "apk":
+            if not rx.find_java():
+                st.error("JDK tidak ditemukan di server. Pastikan `default-jdk-headless` ada di packages.txt.")
+                rr.cleanup(workdir)
+                st.stop()
+            try:
+                with st.spinner("Menyiapkan JADX (unduhan pertama, diverifikasi SHA-256)…"):
+                    extra_env = rx.android_env(rx.ensure_jadx_jar())
+            except rx.SetupError as exc:
+                st.error(str(exc))
+                rr.cleanup(workdir)
+                st.stop()
         with st.spinner("REA sedang menganalisis… (unduhan npx pertama bisa memakan waktu)"):
             res = rr.run_cli(
                 prefix,
@@ -165,12 +268,14 @@ if run_clicked and prefix:
                 workdir,
                 timeout=timeout,
                 out_name="result.json",
+                extra_env=extra_env,
             )
         st.session_state["job"] = {
             "mode": mode_key,
             "workdir": str(workdir),
             "target": str(target),
             "res": res,
+            "extra_env": extra_env,
         }
 
 job = st.session_state.get("job")
@@ -214,3 +319,32 @@ if job and job["mode"] == mode_key and prefix:
                               timeout=timeout, out_name="members.json")
             show_run(mres, "inspect-managed-members")
             show_output(mres, "managed-members.json", "members")
+
+    if res.ok and mode_key == "apk":
+        env = job.get("extra_env")
+        st.divider()
+        st.markdown("**Jelajahi kelas dan dekompilasi method**")
+        q = st.text_input("Cari kelas (potongan nama, peka huruf besar-kecil; kosong = semua)", key="apk_q")
+        if st.button("Cari kelas"):
+            sres = rr.run_cli(prefix, rr.apk_args("search", target, query=q), workdir,
+                              timeout=timeout, out_name="apk-search.json", extra_env=env)
+            show_run(sres, "search-android-classes")
+            show_output(sres, "apk-classes.json", "apk_search")
+        cname = st.text_input("Nama kelas persis", placeholder="com.contoh.MainActivity", key="apk_class")
+        c1, c2 = st.columns(2)
+        if c1.button("Lihat anggota kelas") and cname.strip():
+            cres = rr.run_cli(prefix, rr.apk_args("class", target, class_name=cname.strip()), workdir,
+                              timeout=timeout, out_name="apk-class.json", extra_env=env)
+            show_run(cres, "inspect-android-class")
+            show_output(cres, "apk-class.json", "apk_class")
+        mname = c2.text_input("Nama method persis", placeholder="onCreate", key="apk_method")
+        overload = st.number_input("Indeks overload (isi jika ada beberapa method bernama sama)",
+                                   0, 100, 0, key="apk_overload")
+        use_overload = st.checkbox("Pakai indeks overload", key="apk_use_overload")
+        if st.button("Dekompilasi method") and cname.strip() and mname.strip():
+            mres = rr.run_cli(prefix, rr.apk_args(
+                "method", target, class_name=cname.strip(), method_name=mname.strip(),
+                overload_index=int(overload) if use_overload else None), workdir,
+                timeout=timeout, out_name="apk-method.json", extra_env=env)
+            show_run(mres, "inspect-android-method")
+            show_output(mres, "apk-method.json", "apk_method")
