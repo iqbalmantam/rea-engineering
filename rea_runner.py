@@ -29,16 +29,57 @@ _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 # --------------------------------------------------------------------------
 # Menemukan CLI
 # --------------------------------------------------------------------------
-def tool_env() -> dict[str, str]:
-    """Lingkungan untuk subproses: PATH diawali folder Python aktif.
+def _wheel_root() -> Path | None:
+    """Folder paket `nodejs_wheel` (dari nodejs-wheel-binaries), bila terpasang."""
+    try:
+        import importlib.util
 
-    Paket PyPI `nodejs-wheel-binaries` memasang node/npm/npx di folder yang sama
-    dengan interpreter Python (mis. venv di Streamlit Cloud), yang belum tentu ada
-    di PATH. Cache npm diarahkan ke folder sementara yang pasti bisa ditulis.
+        spec = importlib.util.find_spec("nodejs_wheel")
+        if spec and spec.submodule_search_locations:
+            return Path(list(spec.submodule_search_locations)[0])
+        if spec and spec.origin:
+            return Path(spec.origin).parent
+    except (ImportError, ValueError):
+        pass
+    for entry in sys.path:
+        cand = Path(entry) / "nodejs_wheel"
+        if cand.is_dir():
+            return cand
+    return None
+
+
+def bundled_node() -> tuple[Path | None, Path | None]:
+    """(node, npx-cli.js) dari paket pip, atau (None, None).
+
+    nodejs-wheel-binaries tidak memasang `node`/`npx` ke bin/ venv; binernya ada
+    di folder paketnya sendiri, dan npx dijalankan lewat npx-cli.js milik npm.
+    """
+    root = _wheel_root()
+    if root is None:
+        return None, None
+    node = next(
+        (p for p in [root / "bin" / "node", root / "node", root / "bin" / "node.exe"] if p.is_file()),
+        None,
+    )
+    if node is None:
+        node = next((p for p in root.rglob("node") if p.is_file() and os.access(p, os.X_OK)), None)
+    npx_cli = next(iter(root.rglob("npx-cli.js")), None)
+    return node, npx_cli
+
+
+def tool_env() -> dict[str, str]:
+    """Lingkungan untuk subproses.
+
+    PATH diawali folder `node` dari paket pip (skrip bin `rea` memakai
+    `#!/usr/bin/env node`) dan folder Python aktif. Cache npm diarahkan ke folder
+    sementara yang pasti bisa ditulis.
     """
     env = dict(os.environ)
-    bindir = str(Path(sys.executable).parent)
-    env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
+    extra = [str(Path(sys.executable).parent)]
+    node, _ = bundled_node()
+    if node is not None:
+        extra.insert(0, str(node.parent))
+    env["PATH"] = os.pathsep.join(extra + [env.get("PATH", "")])
     env.setdefault("npm_config_cache", str(Path(tempfile.gettempdir()) / "rea_npm_cache"))
     env.setdefault("npm_config_update_notifier", "false")
     env.setdefault("npm_config_fund", "false")
@@ -46,21 +87,25 @@ def tool_env() -> dict[str, str]:
 
 
 def find_rea_command() -> list[str] | None:
-    """Awalan perintah REA: `rea` jika terpasang, jika tidak `npx -y rea-agents`."""
+    """Awalan perintah REA: `rea` jika ada, lalu npx dari paket pip, lalu npx sistem."""
     override = os.environ.get("REA_COMMAND", "").strip()
     if override:
         return override.split()
+    pkg = os.environ.get("REA_PACKAGE", NPX_PACKAGE)
     path = tool_env()["PATH"]
     if shutil.which("rea", path=path):
         return ["rea"]
+    node, npx_cli = bundled_node()
+    if node is not None and npx_cli is not None:
+        return [str(node), str(npx_cli), "-y", pkg]
     if shutil.which("npx", path=path):
-        pkg = os.environ.get("REA_PACKAGE", NPX_PACKAGE)
         return ["npx", "-y", pkg]
     return None
 
 
 def node_version() -> str | None:
-    node = shutil.which("node", path=tool_env()["PATH"])
+    node_path, _ = bundled_node()
+    node = str(node_path) if node_path else shutil.which("node", path=tool_env()["PATH"])
     if not node:
         return None
     try:
@@ -70,6 +115,38 @@ def node_version() -> str | None:
     except (OSError, subprocess.TimeoutExpired):
         return None
     return out.stdout.strip() or None
+
+
+def diagnostics() -> dict:
+    """Info untuk panel diagnostik saat Node/REA tidak ditemukan."""
+    try:
+        from importlib import metadata
+
+        dists = sorted(
+            f"{d.metadata['Name']}=={d.version}"
+            for d in metadata.distributions()
+            if d.metadata["Name"] and "node" in d.metadata["Name"].lower()
+        )
+    except Exception as exc:  # noqa: BLE001
+        dists = [f"(gagal membaca metadata: {exc})"]
+    root = _wheel_root()
+    node, npx_cli = bundled_node()
+    listing: list[str] = []
+    if root is not None:
+        try:
+            listing = sorted(p.name for p in root.iterdir())[:30]
+        except OSError:
+            pass
+    return {
+        "python": sys.executable,
+        "paket_node_terpasang": dists,
+        "folder_nodejs_wheel": str(root) if root else None,
+        "isi_folder": listing,
+        "node": str(node) if node else None,
+        "npx_cli": str(npx_cli) if npx_cli else None,
+        "node_di_PATH": shutil.which("node"),
+        "npx_di_PATH": shutil.which("npx"),
+    }
 
 
 def node_version_ok(version: str | None) -> bool:

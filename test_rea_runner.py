@@ -99,6 +99,29 @@ def main() -> None:
     assert env["PATH"].split(os.pathsep)[0] == str(Path(sys.executable).parent)
     assert "npm_config_cache" in env
 
+    # 8. Penemuan Node dari paket pip (nodejs_wheel) dengan struktur tiruan
+    wheel = tmp / "site" / "nodejs_wheel"
+    (wheel / "bin").mkdir(parents=True)
+    (wheel / "lib" / "node_modules" / "npm" / "bin").mkdir(parents=True)
+    (wheel / "__init__.py").write_text("")
+    fake_node = wheel / "bin" / "node"
+    fake_node.write_text("#!/bin/sh\necho v22.20.0\n")
+    fake_node.chmod(0o755)
+    (wheel / "lib" / "node_modules" / "npm" / "bin" / "npx-cli.js").write_text("")
+    sys.path.insert(0, str(tmp / "site"))
+    try:
+        node, npx_cli = rr.bundled_node()
+        assert node == fake_node and npx_cli.name == "npx-cli.js"
+        assert rr.tool_env()["PATH"].split(os.pathsep)[0] == str(fake_node.parent)
+        cmd = rr.find_rea_command()
+        assert cmd[:3] == [str(fake_node), str(npx_cli), "-y"], cmd
+        assert rr.node_version() == "v22.20.0"
+        d = rr.diagnostics()
+        assert d["node"] == str(fake_node) and "bin" in d["isi_folder"]
+    finally:
+        sys.path.remove(str(tmp / "site"))
+        sys.modules.pop("nodejs_wheel", None)
+
     rr.cleanup(tmp)
     print("SEMUA UJI LULUS")
 

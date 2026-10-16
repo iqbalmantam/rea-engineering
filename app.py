@@ -89,7 +89,9 @@ with st.sidebar:
     if prefix:
         st.write("**Perintah:** `" + " ".join(prefix) + "`")
     else:
-        st.error("Tidak ada `rea` maupun `npx`. Pasang Node.js dan npm.")
+        st.error("Node.js/npx tidak ditemukan. Buka *Diagnostik* di bawah.")
+    with st.expander("Diagnostik", expanded=prefix is None):
+        st.json(rr.diagnostics())
     if prefix and st.button("Uji koneksi REA"):
         wd = rr.new_workdir()
         with st.spinner("Mengunduh/menjalankan rea-agents…"):
